@@ -16,7 +16,7 @@ import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import safetensors
 import torch
@@ -31,9 +31,12 @@ from freetoken.models.nvfp4_banks import (
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from freetoken.models.config import ModelConfig
 
 # Routed NVFP4 experts: per-expert, un-fused. Matched against the RAW weight_map key in nvfp4_banks.
 # The ``model.language_model.`` anchor excludes the MTP head's stacked ``mtp.layers.N.mlp.experts.*`` tensors.
@@ -248,6 +251,83 @@ class _DenseReader:
         return out
 
 
+def _shard_rows(
+    tensor: torch.Tensor, parts: list[tuple[int, int]], rank: int, size: int, *, row_block: int = 1,
+) -> torch.Tensor:
+    out, offset = [], 0
+    for heads, width in parts:
+        local = div_even(heads, size, allow_replicate=True)
+        start = offset + (rank * heads // size) * width
+        count = local * width
+        if start % row_block or count % row_block:
+            raise ValueError(f"TP={size} cuts a {row_block}-row quantization block")
+        out.append(tensor.narrow(0, start // row_block, count // row_block))
+        offset += heads * width
+    if offset != tensor.shape[0] * row_block:
+        raise ValueError(f"projection has {tensor.shape[0] * row_block} rows, expected {offset}")
+    return torch.cat(out, dim=0).contiguous()
+
+
+def shard_dense_tensor(
+    name: str, tensor: torch.Tensor, config: ModelConfig | None, rank: int, size: int,
+    quant: QuantConfig | None = None,
+) -> torch.Tensor:
+    """Shard normalized projection roles together, preserving whole Q/G heads and quant blocks."""
+    if size == 1 or tensor.ndim == 0:
+        return tensor
+    assert config is not None
+    module, _, role = name.rpartition(".")
+    if role == "input_scale" or name.startswith(VISION_KEY_PREFIXES):
+        return tensor
+    scheme = None if quant is None else quant.scheme_for(module)
+    row_block = 1
+    if role in ("weight_scale", "weight_scale_inv") and tensor.ndim == 2 and scheme is not None:
+        row_block = (scheme.weight.group or (1, 1))[0]
+    parts = None
+    row_parallel = False
+    if module.endswith(".self_attn.qkv_proj"):
+        parts = [(config.num_qo_heads, 2 * config.head_dim),
+                 (config.num_kv_heads, config.head_dim), (config.num_kv_heads, config.head_dim)]
+    elif ".linear_attn." in name:
+        group = config.linear_attention_group()
+        k = (group.num_key_heads, group.key_head_dim)
+        v = (group.num_value_heads, group.value_head_dim)
+        gates = (group.num_value_heads, 1)
+        if module.endswith(".in_proj"):
+            parts = [k, k, v, v, gates, gates]
+        elif module.endswith(".in_proj_qkvz"):
+            parts = [k, k, v, v]
+        elif module.endswith(".in_proj_ba"):
+            parts = [gates, gates]
+        elif module.endswith(".conv1d"):
+            parts = [k, k, v]
+        elif role in ("A_log", "dt_bias"):
+            parts = [gates]
+        elif module.endswith(".out_proj"):
+            row_parallel = True
+    elif module.endswith(".shared_expert.gate_up_proj"):
+        intermediate = config.shared_expert_intermediate_size
+        div_even(intermediate, size)
+        parts = [(intermediate, 1), (intermediate, 1)]
+    elif module.endswith((".self_attn.o_proj", ".shared_expert.down_proj")):
+        row_parallel = True
+    elif module in ("model.embed_tokens", "lm_head"):
+        rows = div_ceil(config.vocab_size, size)
+        start = min(rank * rows, config.vocab_size)
+        count = min(rows, config.vocab_size - start)
+        if start % row_block or rows % row_block:
+            raise ValueError("TP vocabulary shard cuts a quantization block")
+        out = tensor.new_zeros((rows // row_block, *tensor.shape[1:]))
+        out[:count // row_block].copy_(tensor[start // row_block:(start + count) // row_block])
+        return out
+    if parts is not None:
+        return _shard_rows(tensor, parts, rank, size, row_block=row_block)
+    if row_parallel and tensor.ndim == 2:
+        width = div_even(tensor.shape[1], size)
+        return tensor.narrow(1, rank * width, width).contiguous()
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -263,12 +343,14 @@ def iter_weights(
     Fusions, per role: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
 
+    from .config import parse_config
+
+    tp = get_tp_info()
     hf_config = cached_load_hf_config(model_path)
+    config = parse_config(hf_config) if tp.size > 1 else None
     spec = get_model_spec(hf_config.architectures[0])
     reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
     for file in tqdm(
@@ -285,10 +367,8 @@ def iter_weights(
                     continue
                 tensor = f.get_tensor(raw_name)
                 emitted = None if name.startswith(VISION_KEY_PREFIXES) else reader.add(name, tensor)
-                if emitted is None:
-                    yield name, tensor
-                else:
-                    yield from emitted
+                for key, value in ([(name, tensor)] if emitted is None else emitted):
+                    yield key, shard_dense_tensor(key, value, config, tp.rank, tp.size, reader.quant)
 
     if reader.pending:
         lines = reader.missing()

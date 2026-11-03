@@ -139,6 +139,10 @@ class Qwen4ExpMTPDraft(BaseOP):
             raise ValueError(f"{path} has no mtp.* tensors")
 
     def __init__(self, config: ModelConfig, target_model, quant=None) -> None:
+        from freetoken.distributed import get_tp_info
+
+        if get_tp_info().size > 1:
+            raise NotImplementedError("qwen4_exp MTP weights are not tensor-parallel; disable speculative decoding")
         draft = draft_config(config)
         # a Strata pack carries its own ggml types
         self.config = draft = draft if quant is None else dataclasses.replace(draft, quant=quant)

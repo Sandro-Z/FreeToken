@@ -86,12 +86,21 @@ class LinearColParallelMerged(_LinearTPImpl):
         output_sizes: List[int],
         has_bias: bool,
         *,
+        local_output_sizes: List[int] | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
-        # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        if local_output_sizes is None:
+            tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        else:
+            # A merged GDN segment can mix replicated key heads with sharded value heads.
+            if len(local_output_sizes) != len(output_sizes):
+                raise ValueError("local_output_sizes must match the merged projection segments")
+            if any(local <= 0 or local > full
+                   for full, local in zip(output_sizes, local_output_sizes)):
+                raise ValueError("local output segments must be positive and no larger than the full segments")
+            tp_output_sizes = list(local_output_sizes)
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(

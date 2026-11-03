@@ -85,6 +85,32 @@ def _kind_suffix(kind: str) -> str:
     return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
 
 
+def shard_expert_tensor(
+    role: str, tensor: torch.Tensor, intermediate: int, rank: int, size: int,
+) -> torch.Tensor:
+    """Split gate/up rows and packed down columns at the same intermediate boundary."""
+    from freetoken.utils import div_even
+
+    local = div_even(intermediate, size)
+    if local % 16:
+        raise ValueError(f"NVFP4 TP={size} needs intermediate/TP divisible by 16, got {local}")
+    if role.endswith("_input") or (role.endswith("_global") and tensor.numel() == 1):
+        return tensor
+    start = rank * local
+    if role.startswith("down"):
+        if role == "down_global":
+            return tensor
+        block = 16 if role == "down_scale" else 2
+        if tensor.ndim != 2 or tensor.shape[1] * block != intermediate:
+            raise ValueError(f"invalid NVFP4 {role} intermediate dimension")
+        return tensor.narrow(1, start // block, local // block).contiguous()
+    if role.startswith(("gate", "up")):
+        if tensor.shape[0] != intermediate:
+            raise ValueError(f"invalid NVFP4 {role} intermediate dimension")
+        return tensor.narrow(0, start, local).contiguous()
+    raise ValueError(f"unknown NVFP4 expert role {role}")
+
+
 def iter_nvfp4_expert_pieces(
     model_path: str,
     config,
@@ -165,7 +191,15 @@ def iter_nvfp4_expert_pieces(
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
             yield name, _ingest(spec, act, wanted[name][2], tensor)
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=per_expert)
+    from freetoken.distributed import try_get_tp_info
+
+    tp = try_get_tp_info()
+    stream = _parallel() if parallel else _serial()
+    if tp is not None and tp.size > 1:
+        source = stream
+        stream = ((name, shard_expert_tensor(wanted[name][2], tensor, config.moe_intermediate_size, tp.rank, tp.size))
+                  for name, tensor in source)
+    return per_expert_pieces(stream, wanted.get, tensors_per_expert=per_expert)
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

@@ -49,6 +49,46 @@ def _dequant_ref(packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Te
     return w * s * row_global.float().unsqueeze(1)
 
 
+@pytest.mark.parametrize("size", [2, 4, 8])
+@pytest.mark.parametrize("row_globals", [False, True])
+def test_tp_packed_experts_sum_to_the_unsharded_dequant_reference(size, row_globals):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.models.nvfp4_banks import shard_expert_tensor
+
+    torch.manual_seed(41)
+    hidden, intermediate = 64, 640
+    pieces, weights = {}, {}
+    for proj, rows, cols in (("gate", intermediate, hidden), ("up", intermediate, hidden), ("down", hidden, intermediate)):
+        packed = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+        scale = (torch.rand(rows, cols // 16) + 0.5).to(torch.float8_e4m3fn)
+        global_scale = torch.rand(rows if row_globals else 1) * 0.01 + 0.01
+        pieces.update({proj: packed, proj + "_scale": scale, proj + "_global": global_scale,
+                       proj + "_input": torch.tensor([0.125])})
+        weights[proj] = _dequant_ref(packed, scale, global_scale.expand(rows))
+    x = torch.randn(3, hidden) / 8
+    expected = (torch.nn.functional.silu(x @ weights["gate"].T) * (x @ weights["up"].T)) @ weights["down"].T
+    outputs, bank_bytes = [], 0
+    kernel = TritonNvfp4MoEKernel()
+    for rank in range(size):
+        cfg = MoEConfig(num_experts=1, hidden=hidden, intermediate=intermediate, top_k=1, tp_rank=rank, tp_size=size)
+        local = {role: shard_expert_tensor(role, tensor, intermediate, rank, size).unsqueeze(0)
+                 for role, tensor in pieces.items()}
+        banks = {role: torch.empty((1, *spec.shape), dtype=spec.dtype) for role, spec in kernel.layout(cfg).items()}
+        kernel.pack(local, cfg, banks)
+        gate_up = _dequant_ref(banks["gate_up"][0], banks["gate_up_scale"][0], banks["gate_up_global"][0])
+        down = _dequant_ref(banks["down"][0], banks["down_scale"][0], banks["down_global"][0])
+        gate, up = (x @ gate_up.T).chunk(2, dim=-1)
+        outputs.append((torch.nn.functional.silu(gate) * up) @ down.T)
+        bank_bytes += sum(t.numel() * t.element_size() for t in banks.values())
+    torch.testing.assert_close(sum(outputs), expected, atol=1e-6, rtol=2e-5)
+    full_cfg = MoEConfig(num_experts=1, hidden=hidden, intermediate=intermediate, top_k=1)
+    full_bytes = sum(math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
+                     for spec in kernel.layout(full_cfg).values())
+    # The down projection's per-output globals have no intermediate axis and stay replicated.
+    assert bank_bytes == full_bytes + (size - 1) * hidden * 4
+
+
 def _make_native_sources(device: torch.device, seed: int = 0) -> dict[str, list[torch.Tensor]]:
     """Random ModelOpt-style banks, CPU pinned, with one expert whose w1/w3 globals differ.
 
@@ -371,7 +411,7 @@ def test_triton_swigluoai_matches_dequant_reference():
 
 @cuda
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
-@pytest.mark.parametrize("hidden_size,inter", [(256, 128), (384, 192)])
+@pytest.mark.parametrize("hidden_size,inter", [(256, 128), (384, 192), (256, 80)])
 @pytest.mark.parametrize("block_m", [64, 128])
 def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter, block_m):
     """Both prefill GEMMs go to the Gluon kernel and match the Triton kernel: persistent (BLOCK_SIZE_M 64) and not (128), 256- and 128-row tiles, K % 256 == 0 and not."""

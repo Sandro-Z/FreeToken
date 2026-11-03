@@ -113,8 +113,8 @@ def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False, mxfp8_sc
     })
     ple = f"{lm}.layers.0.ple"
     raw.update({
-        f"{ple}.key_proj.weight": _bf16(HCH, H),
-        f"{ple}.value_proj.weight": _bf16(H, H),
+        f"{ple}.key_proj.weight": _bf16(HCH, 64),
+        f"{ple}.value_proj.weight": _bf16(H, 64),
         f"{ple}.norm_key.weight": _bf16(HCH),
         f"{ple}.norm_query.weight": _bf16(HCH),
         f"{ple}.norm_conv.weight": _bf16(HCH),
@@ -208,12 +208,13 @@ CT_CHANNEL_FP8_QUANT = {
 
 def _config_json(quantization_config) -> dict:
     cfg = hf_config(
-        num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=2,
+        num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=4,
         budget=16, hidden=H, max_position=4096, rope_theta=10000.0,
         layer_types=["linear_attention", "full_attention"],
         linear_num_key_heads=KH, linear_num_value_heads=VH,
         linear_key_head_dim=HD, linear_value_head_dim=HD,
         hc_lowrank=LR, ple_layer_ids=[1],
+        vocab_size=11,
         num_experts=E, moe_intermediate_size=I, shared_expert_intermediate_size=I,
     )
     return {**vars(cfg), "text_config": vars(cfg.text_config), "quantization_config": quantization_config}
@@ -353,6 +354,102 @@ def test_shared_expert_gate_up_merge(loaded, checkpoint):
     merged = loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
     assert torch.equal(merged[:I], raw[f"{base}.gate_proj.weight"])
     assert torch.equal(merged[I:], raw[f"{base}.up_proj.weight"])
+
+
+def test_tp_reader_fills_local_buffers_and_reconstructs_projections(checkpoint, monkeypatch):
+    from freetoken.distributed import DistributedInfo
+    import freetoken.distributed.info as info
+
+    folder, _raw = checkpoint
+    full = _load(folder, vision=False)
+    ranks = []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        local = _load(folder, vision=False)
+        state = meta_state_dict(folder)
+        assert set(local) == set(state)
+        for name, value in local.items():
+            assert value.shape == state[name].shape, name
+        ranks.append(local)
+
+    for name, sizes in (
+        ("model.layers.1.self_attn.qkv_proj.weight", [2 * QH * AHD, KVH * AHD, KVH * AHD]),
+        ("model.layers.0.linear_attn.in_proj.weight", [KH * HD, KH * HD, VH * HD, VH * HD, VH, VH]),
+        ("model.layers.0.linear_attn.conv1d.weight", [KH * HD, KH * HD, VH * HD]),
+        ("model.layers.1.mlp.shared_expert.gate_up_proj.weight", [I, I]),
+    ):
+        pieces = [torch.split(local[name], [n // 2 for n in sizes]) for local in ranks]
+        rebuilt = torch.cat([torch.cat([pieces[r][part] for r in range(2)]) for part in range(len(sizes))])
+        assert torch.equal(rebuilt, full[name]), name
+    for name in ("model.layers.1.self_attn.o_proj.weight", "model.layers.0.linear_attn.out_proj.weight",
+                 "model.layers.1.mlp.shared_expert.down_proj.weight"):
+        assert torch.equal(torch.cat([local[name] for local in ranks], dim=1), full[name]), name
+    for name in ("model.embed_tokens.weight", "lm_head.weight"):
+        assert torch.equal(torch.cat([local[name] for local in ranks])[:11], full[name]), name
+    for name in ("model.layers.0.ple.key_proj.weight", "model.layers.1.self_attn.indexer.index_qk_proj.weight"):
+        assert all(torch.equal(local[name], full[name]) for local in ranks), name
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_tp_attention_head_shards_preserve_gqa_and_output_gates(size):
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.weight import shard_dense_tensor
+
+    config = parse_config(hf_config(num_q=24, num_kv=2, head_dim=16, hidden=32))
+    torch.manual_seed(19)
+    x = torch.randn(3, 32)
+    qg = torch.randn(24 * 32, 32)
+    k, v = torch.randn(2, 32, 32)
+    o = torch.randn(32, 24 * 16)
+    weight = torch.cat([qg, k, v])
+    q, gate = (x @ qg.T).reshape(3, 24, 32).chunk(2, dim=-1)
+    keys, values = (x @ k.T).reshape(3, 2, 16), (x @ v.T).reshape(3, 2, 16)
+    attention = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(0, 1), keys.repeat_interleave(12, 1).transpose(0, 1),
+        values.repeat_interleave(12, 1).transpose(0, 1), is_causal=True,
+    ).transpose(0, 1)
+    expected = (attention * gate.sigmoid()).reshape(3, -1) @ o.T
+    outputs = []
+    for rank in range(size):
+        local = shard_dense_tensor("model.layers.0.self_attn.qkv_proj.weight", weight, config, rank, size)
+        nq, nk = 24 // size, max(1, 2 // size)
+        qg_local, k_local, v_local = (x @ local.T).split([2 * nq * 16, nk * 16, nk * 16], dim=-1)
+        q_local, gate_local = qg_local.reshape(3, nq, 32).chunk(2, dim=-1)
+        keys = k_local.reshape(3, nk, 16).repeat_interleave(nq // nk, 1)
+        values = v_local.reshape(3, nk, 16).repeat_interleave(nq // nk, 1)
+        attention = torch.nn.functional.scaled_dot_product_attention(
+            q_local.transpose(0, 1), keys.transpose(0, 1), values.transpose(0, 1), is_causal=True,
+        ).transpose(0, 1)
+        out_weight = shard_dense_tensor("model.layers.0.self_attn.o_proj.weight", o, config, rank, size)
+        outputs.append((attention * gate_local.sigmoid()).reshape(3, -1) @ out_weight.T)
+    torch.testing.assert_close(sum(outputs), expected, atol=2e-4, rtol=2e-5)
+
+
+def test_tp_channel_scales_follow_their_projection_rows(checkpoint_fp8_channel, monkeypatch):
+    from freetoken.distributed import DistributedInfo
+    import freetoken.distributed.info as info
+
+    folder, _raw = checkpoint_fp8_channel
+    full = _load(folder, vision=False)
+    ranks = []
+    for rank in range(2):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        ranks.append(_load(folder, vision=False))
+    for module, splits in (
+        ("model.layers.1.self_attn.qkv_proj", [2 * QH * AHD, KVH * AHD, KVH * AHD]),
+        ("model.layers.0.linear_attn.in_proj_qkvz", [KH * HD, KH * HD, VH * HD, VH * HD]),
+        ("model.layers.1.mlp.shared_expert.gate_up_proj", [I, I]),
+    ):
+        expected = full[module + ".weight"].float() * full[module + ".weight_scale"][:, None]
+        pieces = [(local[module + ".weight"].float() * local[module + ".weight_scale"][:, None])
+                  .split([n // 2 for n in splits]) for local in ranks]
+        rebuilt = torch.cat([torch.cat([pieces[r][part] for r in range(2)]) for part in range(len(splits))])
+        torch.testing.assert_close(rebuilt, expected, atol=0, rtol=0)
+    for module in ("model.layers.1.self_attn.o_proj", "model.layers.0.linear_attn.out_proj"):
+        expected = full[module + ".weight"].float() * full[module + ".weight_scale"][:, None]
+        rebuilt = torch.cat([local[module + ".weight"].float() * local[module + ".weight_scale"][:, None]
+                             for local in ranks], dim=1)
+        torch.testing.assert_close(rebuilt, expected, atol=0, rtol=0)
 
 
 ZERO_CENTERED = (

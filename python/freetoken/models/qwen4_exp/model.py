@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
@@ -226,6 +227,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
     def __init__(self, config: ModelConfig) -> None:
+        if config.is_multimodal and get_tp_info().size > 1:
+            raise NotImplementedError("qwen4_exp TP requires --text-model-only; the vision weights are not sharded")
         super().__init__(config)
         if config.is_multimodal:
             assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"

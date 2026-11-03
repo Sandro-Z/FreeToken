@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import List, Tuple
@@ -320,6 +321,11 @@ def parse_args(
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument(
+        "--distributed-timeout", type=float, default=ServerArgs.distributed_timeout,
+        help="Collective timeout in seconds; allow for skew between ranks during cold checkpoint loading.",
     )
 
     parser.add_argument(
@@ -962,10 +968,13 @@ def parse_args(
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    if kwargs["tensor_parallel_size"] < 1:
+        parser.error("--tensor-parallel-size must be positive")
+    if not math.isfinite(kwargs["distributed_timeout"]) or kwargs["distributed_timeout"] <= 0:
+        parser.error("--distributed-timeout must be a finite positive number")
+
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
-        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"

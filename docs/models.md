@@ -22,6 +22,9 @@ for them; other checkpoints of the same architectures work too.
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 | Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
 
+For the Qwen3.8 NVFP4 multi-GPU text-serving path and the platform's SGLang
+launcher, see [tensor parallelism and platform deployment](multi-gpu.md).
+
 ### Image input
 
 These families accept image input by default; pass `--text-model-only` to skip the vision encoder. The flags are described in the

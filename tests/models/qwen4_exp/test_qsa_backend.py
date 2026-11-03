@@ -75,9 +75,10 @@ def _dense_oracle(fixture: Fixture):
 
 
 @requires_cuda
-def test_decode_is_dense_below_the_budget(monkeypatch):
+@pytest.mark.parametrize("num_q,num_kv", [(4, 2), (3, 1)])
+def test_decode_is_dense_below_the_budget(monkeypatch, num_q, num_kv):
     """Prefill then five decode steps, sparse path vs the fp32 dense oracle."""
-    config = parsed_config()
+    config = parsed_config(num_q=num_q, num_kv=num_kv)
     fixture = Fixture(config, num_pages=128)
     attn = fixture.layer(QSA_LAYER)
     lengths, steps = [300, 411, 64], 5
